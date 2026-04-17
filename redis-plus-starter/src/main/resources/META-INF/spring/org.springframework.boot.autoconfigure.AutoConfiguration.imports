@@ -1,0 +1,9 @@
+com.actomize.redis.plus.autoconfigure.core.RedisPlusCoreAutoConfiguration
+com.actomize.redis.plus.autoconfigure.datasource.RedisPlusDataSourceAutoConfiguration
+com.actomize.redis.plus.autoconfigure.lock.RedisPlusLockAutoConfiguration
+com.actomize.redis.plus.autoconfigure.cache.RedisPlusCacheAutoConfiguration
+com.actomize.redis.plus.autoconfigure.enhance.RedisPlusEnhanceAutoConfiguration
+com.actomize.redis.plus.autoconfigure.ratelimit.RedisPlusRateLimitAutoConfiguration
+com.actomize.redis.plus.autoconfigure.idempotent.RedisPlusIdempotentAutoConfiguration
+com.actomize.redis.plus.autoconfigure.queue.RedisPlusQueueAutoConfiguration
+com.actomize.redis.plus.autoconfigure.governance.RedisPlusGovernanceAutoConfiguration

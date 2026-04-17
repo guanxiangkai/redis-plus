@@ -1,0 +1,311 @@
+# ==============================================================================
+# Redis Plus 配置示例 (application.yml)
+#
+# 说明：
+#   1. 本文件只保留当前源码中真实支持的配置项，配置前缀均为 redis-plus。
+#   2. 单数据源使用 Spring Boot 标准配置 spring.data.redis.*。
+#   3. 多数据源使用 redis-plus.datasource.sources.*，由 starter 自动构建连接工厂。
+#   4. 未引入 Caffeine 时，L1 本地缓存自动退化为 ConcurrentHashMap。
+#   5. 未引入 Micrometer / Actuator 时，指标与健康检查自动跳过。
+#   6. 读写锁支持锁降级：同一线程持有写锁期间可直接获取同名读锁（写→读降级）。
+#      其他线程仍无法获取读锁，直至写锁持有方完全释放写锁与读锁。
+#   7. 锁切面异常传播：若业务方法抛出异常且锁同时过期（WatchDog 续期失败），
+#      原始业务异常会正确传播，unlock 失败仅以 WARN 日志记录，不屏蔽原始异常。
+#   8. 幂等 FAILED 并发重试已序列化：多个并发请求竞争重试失败态时，仅一个线程
+#      通过 Redis CAS 赢得执行权，其余线程收到"正在处理中"响应，杜绝并发重复执行。
+#   9. 队列生命周期：使用默认（无参/最小参数）构造器时，队列自持异步执行器；
+#      调用 stop() 后执行器会被同步关闭，无后台线程泄漏。
+#      传入自定义 asyncExecutor 时，生命周期由调用方管理。
+# ==============================================================================
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 场景一：单数据源（最常见）
+# 直接使用 Spring Boot 标准配置，无需配置 redis-plus.datasource.*。
+# ──────────────────────────────────────────────────────────────────────────────
+spring:
+  data:
+    redis:
+      host: ${REDIS_HOST:localhost}
+      port: ${REDIS_PORT:6379}
+      password: ${REDIS_PASSWORD:}
+      database: ${REDIS_DB:0}
+      timeout: 3s
+      connect-timeout: 3s
+      lettuce:
+        pool:
+          enabled: true
+          max-active: 16
+          max-idle: 8
+          min-idle: 2
+          max-wait: 3s
+
+# ------------------------------------------------------------------------------
+# 场景二：多数据源
+# 通过 redis-plus.datasource.sources.* 声明所有数据源。
+#
+# ★ 切换方式说明：
+#   sources 下的每一个 key 就是该数据源的「路由标签」，与 @RedisDS 注解值一一对应：
+#
+#   sources:
+#     master:  ← 这个 "master" 就是标签，对应 @RedisDS("master")
+#     slave:   ← 这个 "slave" 就是标签，对应 @RedisDS("slave")
+#     cache:   ← 这个 "cache" 就是标签，对应 @RedisDS("cache")
+#
+#   使用方式：
+#     1. 注解式（推荐）：
+#        @RedisDS("slave")
+#        public String get(String key) { return redisTemplate.opsForValue().get(key); }
+#
+#     2. 编程式：
+#        RedisDataSourceContext.callWithSource("cache",
+#            () -> redisTemplate.opsForValue().get("hot-key"));
+#
+#   注意：
+#   - primary 指定无 @RedisDS 注解时默认使用哪个数据源（必须在 sources 中存在）
+#   - strict=true 时，路由到未声明的标签会抛异常；false 时回退到 primary
+#   - 配置了 sources 后，spring.data.redis.* 不再被 redis-plus 使用
+#   - database 字段是 Redis 数据库编号（0~15），不是路由标签
+# ------------------------------------------------------------------------------
+#redis-plus:
+#  datasource:
+#    primary: master          # ← 默认数据源标签，无 @RedisDS 注解时走这里
+#    strict: false            # true：路由未知标签时抛异常；false：回退 primary
+#    sources:
+#      # ── 标签 "master" ── 对应 @RedisDS("master") ──
+#      master:
+#        host: ${REDIS_MASTER_HOST:localhost}
+#        port: ${REDIS_MASTER_PORT:6379}
+#        password: ${REDIS_MASTER_PASSWORD:}
+#        database: 0          # Redis DB 编号，0~15，与路由标签无关
+#        timeout: 3s
+#        connect-timeout: 3s
+#        pool:
+#          enabled: true
+#          max-active: 16
+#          max-idle: 8
+#          min-idle: 2
+#          max-wait: 3s
+#      # ── 标签 "slave" ── 对应 @RedisDS("slave") ──
+#      slave:
+#        host: ${REDIS_SLAVE_HOST:localhost}
+#        port: ${REDIS_SLAVE_PORT:6380}
+#        password: ${REDIS_SLAVE_PASSWORD:}
+#        database: 0
+#        timeout: 3s
+#        connect-timeout: 3s
+#        pool:
+#          enabled: true
+#          max-active: 32
+#          max-idle: 16
+#          min-idle: 4
+#          max-wait: 3s
+#      # ── 标签 "cache" ── 对应 @RedisDS("cache") ──
+#      cache:
+#        host: ${REDIS_CACHE_HOST:localhost}
+#        port: ${REDIS_CACHE_PORT:6381}
+#        password: ${REDIS_CACHE_PASSWORD:}
+#        database: 1          # 这个实例专用 DB 1，与标签名无关
+#        timeout: 2s
+#        connect-timeout: 2s
+#        pool:
+#          enabled: true
+#          max-active: 8
+#          max-idle: 4
+#          min-idle: 1
+#          max-wait: 2s
+
+
+# ------------------------------------------------------------------------------
+# Redis Plus 统一配置
+# 对应类：com.actomize.redis.plus.autoconfigure.properties.RedisPlusProperties
+# ------------------------------------------------------------------------------
+redis-plus:
+  # ---------- 分布式锁 ----------
+  lock:
+    # 锁 Key 前缀（由 KeyNamingStrategy 统一拼装，默认输出仍为 key-prefix + 锁名）
+    key-prefix: ${REDIS_PLUS_LOCK_PREFIX:demo:lock:}
+    # 默认锁租约时长（注解未显式给 leaseTime 时由 LockLeaseStrategy 统一决策）
+    default-lease: 30s
+    # 默认等待超时（@RedisLock/@RedisReadLock/@RedisWriteLock 未显式给 waitTime 时生效）
+    default-wait: 5s
+
+  # ---------- 三级缓存 ----------
+  cache:
+    # Redis 缓存 Key 前缀；为空表示由业务自行控制 key 命名
+    key-prefix: ${REDIS_PLUS_CACHE_PREFIX:demo:cache:}
+    # 默认 TTL
+    default-ttl: 30m
+    # TTL 随机抖动比例，防止同一时刻大量过期造成雪崩（0 = 不抖动，建议 0.1~0.3）
+    jitter-ratio: 0.10
+    local:
+      # L1 本地缓存最大条目数
+      maximum-size: 10000
+      # L1 本地缓存 TTL（通常远小于 Redis TTL，减少内存占用并及时感知失效）
+      ttl: 5m
+
+  # ---------- 缓存增强（布隆过滤器 + 批量操作） ----------
+  enhance:
+    bloom:
+      # 是否启用默认布隆过滤器与 @BloomCheck 切面
+      enabled: true
+      # 预估元素数量（影响底层 BitMap 大小，过小会升高误判率）
+      expected-insertions: 1000000
+      # 目标误判率（推荐 0.01 ~ 0.03）
+      false-positive-probability: 0.01
+
+  # ---------- 限流 ----------
+  ratelimit:
+    # 限流 Key 前缀
+    key-prefix: ${REDIS_PLUS_RL_PREFIX:demo:ratelimit:}
+    # 令牌桶默认每秒补充令牌数；当 @RateLimit(TOKEN_BUCKET) 未显式指定 refillTokens 时回退到该值
+    token-bucket-refill-rate: 100
+
+  # ---------- 幂等 ----------
+  idempotent:
+    # 幂等状态 Key 前缀（最终 Key = key-prefix + @Idempotent 的 key 表达式）
+    key-prefix: ${REDIS_PLUS_IDEMPOTENT_PREFIX:demo:idempotent:}
+
+  # ---------- 队列 ----------
+  queue:
+    # 队列 Key 前缀基名；默认工厂会自动派生 list:/stream: 前缀
+    key-prefix: ${REDIS_PLUS_QUEUE_PREFIX:demo:queue:}
+    # Stream 队列默认消费组名称
+    default-consumer-group: redis-plus-consumers
+    # 消费失败最大重试次数（默认工厂会将其映射为固定间隔、非阻塞调度的重试策略）
+    max-retry-attempts: 3
+    # Stream 队列每次批量拉取消息数（XREADGROUP COUNT 参数）
+    batch-size: 10
+    # 消费轮询阻塞等待时长（List BRPOP / Stream XREADGROUP BLOCK）
+    poll-timeout: 2s
+
+# ------------------------------------------------------------------------------
+# Actuator / Micrometer（可选）
+# 仅当项目中引入 spring-boot-starter-actuator 时生效
+# ------------------------------------------------------------------------------
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,metrics,prometheus
+  endpoint:
+    health:
+      show-details: when-authorized
+  # 开启 Prometheus 格式指标暴露（需引入 micrometer-registry-prometheus）
+  # metrics:
+  #   export:
+  #     prometheus:
+  #       enabled: true
+
+# ------------------------------------------------------------------------------
+# 日志建议
+# ------------------------------------------------------------------------------
+logging:
+  level:
+    com.actomize.redis.plus: INFO
+    # 调试时按需开启：
+    # com.actomize.redis.plus.lock: DEBUG
+    # com.actomize.redis.plus.cache: DEBUG
+    # com.actomize.redis.plus.enhance: DEBUG
+    # com.actomize.redis.plus.ratelimit: DEBUG
+    # com.actomize.redis.plus.idempotent: DEBUG
+    # com.actomize.redis.plus.queue: DEBUG
+    # com.actomize.redis.plus.datasource: DEBUG
+    # io.lettuce.core: INFO
+
+# ------------------------------------------------------------------------------
+# 可选依赖提示
+# ------------------------------------------------------------------------------
+# 1. 需要 L1 Caffeine 本地缓存时，请额外引入：
+#    implementation("com.github.ben-manes.caffeine:caffeine")
+#
+# 2. 需要 Micrometer 指标 / 健康检查时，请额外引入：
+#    implementation("org.springframework.boot:spring-boot-starter-actuator")
+#
+# 3. 需要 Prometheus 指标格式时，请额外引入：
+#    implementation("io.micrometer:micrometer-registry-prometheus")
+#
+# 4. 多数据源说明：
+#    - YAML 方式（推荐）：配置 redis-plus.datasource.sources.*，starter 自动构建连接工厂。
+#      需确保 commons-pool2 在 classpath 上（spring-boot-starter-data-redis 已传递引入）。
+#   - 编程方式（高级）：自行注册 MultiRedisConnectionFactory Bean，
+#      starter 自动检测并激活 @RedisDS 路由切面。
+#      MultiRedisConnectionFactory 实现了 RedisConnectionFactory 接口，
+#      可直接注入到 RedisTemplate / StringRedisTemplate 中使用。
+#    - 路由注解示例：
+#        @RedisDS("slave")
+#        public String getValue(String key) { ... }
+#    - 编程式切换示例：
+#        RedisDataSourceContext.callWithSource("slave",
+#            () -> redisTemplate.opsForValue().get("key"));
+#
+# 5. 队列使用示例：
+#    - List 简单队列（适合日志异步处理等容忍丢失场景）：
+#        @Bean
+#        public RedisListQueue<OrderEvent> orderQueue(
+#                StringRedisTemplate tpl, ValueSerializer ser) {
+#            return new RedisListQueue<>("order-events", OrderEvent.class, tpl, ser);
+#        }
+#    - Stream 消费组队列（适合关键业务，支持手动 ACK + 非阻塞重试）：
+#        @Bean
+#        public RedisStreamQueue<OrderEvent> orderStream(
+#                StringRedisTemplate tpl, ValueSerializer ser) {
+#            return new RedisStreamQueue<>("order-stream", "my-group",
+#                    OrderEvent.class, tpl, ser);
+#        }
+#    - 同步拉取时，receive() 返回 QueueDelivery：
+#        QueueDelivery<OrderEvent> delivery = orderStream.receive(Duration.ofSeconds(2));
+#        if (delivery != null) {
+#            handle(delivery.message());
+#            if (delivery.mode() == QueueDelivery.DeliveryMode.PENDING_ACKNOWLEDGMENT) {
+#                delivery.acknowledge();   # Stream 队列需要显式 ACK；List 队列为 ALREADY_DEQUEUED
+#            }
+#        }
+#    - 使用工厂类（注入 RedisQueueFactory）：
+#        QueueSubscription sub1 = factory.createListQueue("my-queue", MyMessage.class)
+#            .subscribe(this::handle);
+#        QueueSubscription sub2 = factory.createStreamQueue("my-stream", "my-group", MyMessage.class)
+#            .subscribe(this::handle);
+#      可在需要时调用 sub1.stop() / sub2.stop() 主动停止订阅
+#
+# 6. 锁 SPI 扩展示例：
+#    - 自定义锁失败处理（返回降级值而非抛异常）：
+#        @Bean
+#        public LockFailureHandler lockFailureHandler() {
+#            return LockFailureHandler.returnFallback(null);
+#        }
+#    - 监听锁生命周期事件：
+#        @Component
+#        public class AuditLockListener implements LockEventListener {
+#            @Override
+#            public void onAcquired(LockAcquiredEvent e) {
+#                log.info("锁获取成功: key={}", e.getKey());
+#            }
+#        }
+#    - 写锁降级为读锁示例（同一线程先持有写锁，再获取读锁，实现降级）：
+#        DistributedReadWriteLock rwLock = lockFactory.getReadWriteLock("order-lock");
+#        DistributedLock writeLock = rwLock.writeLock();
+#        DistributedLock readLock  = rwLock.readLock();
+#        writeLock.lock();            // 先获取写锁
+#        try {
+#            // ... 写操作 ...
+#            readLock.tryLock();      // 降级：同线程持有写锁时可获取读锁
+#            try {
+#                // ... 读操作（此时其他线程无法获取读锁或写锁）...
+#            } finally {
+#                readLock.unlock();   // 先释放读锁
+#            }
+#        } finally {
+#            writeLock.unlock();      // 再释放写锁，其他读线程才可进入
+#        }
+#
+# 7. 事件监听说明：
+#    - RedisPlusEvent 继承 Spring ApplicationEvent，支持类型化 @EventListener：
+#        @EventListener
+#        public void onLockAcquired(LockAcquiredEvent event) {
+#            log.info("锁获取成功: key={}, 等待={}ms", event.getKey(), event.getWaitTime().toMillis());
+#        }
+#        @EventListener
+#        public void onLockFailed(LockFailedEvent event) {
+#            alertService.send("锁竞争失败: " + event.getKey() + ", 原因: " + event.getReason());
+#        }
+#    - 也可以通过 LockEventListener SPI 回调监听（无需 Spring 容器）
